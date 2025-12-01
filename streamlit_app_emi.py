@@ -1,116 +1,189 @@
- # app.py (minimal)
+ #app.py ‚Äî Clean UTF-8 Streamlit App with Remote Model Loading (Requests)
+
 import streamlit as st
 from pathlib import Path
 import joblib, io, requests, os
+import pandas as pd
+import unicodedata, re
 
 APP_DIR = Path(__file__).resolve().parent
 
-st.title("EMI Model Demo")
+st.set_page_config(page_title="EMI Model Demo", layout="centered")
+st.title("EMI Prediction App")
 
-# ---------- helpers ----------
+# -------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------
+
 def clean_col_name(s):
+    """Normalize and clean column names."""
     s = str(s)
-    s = unicodedata.normalize('NFKC', s)
-    s = re.sub(r'[\x00-\x1f\x7f-\x9f\uFEFF]', '', s)
-    s = s.replace('ì', '"').replace('î', '"').replace('í', "'").replace('ñ','-').replace('ó','-')
-    s = re.sub(r'[^\w]', '_', s)
-    s = re.sub(r'__+', '_', s)
-    s = s.strip('_').lower()
-    return s
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"[\x00-\x1f\x7f-\x9f\uFEFF]", "", s)  # remove invisible ctrl chars
+    s = s.replace("‚Äú", '"').replace("‚Äù", '"')
+    s = s.replace("‚Äô", "'").replace("‚Äò", "'")
+    s = s.replace("‚Äì", "-").replace("‚Äî", "-")
+    s = re.sub(r"[^\w]", "_", s)
+    s = re.sub(r"__+", "_", s)
+    return s.strip("_").lower()
+
 
 def normalize_cols(df):
     df = df.copy()
     df.columns = [clean_col_name(c) for c in df.columns]
     return df
 
+
+def safe_read_csv(uploaded_file):
+    """Try multiple encodings. Prevents utf-8 decode errors."""
+    raw = uploaded_file.read()
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin1"):
+        try:
+            df = pd.read_csv(io.BytesIO(raw), encoding=enc)
+            return df, enc
+        except Exception:
+            pass
+
+    try:
+        df = pd.read_csv(io.BytesIO(raw), engine="python")
+        return df, "python-engine"
+    except Exception:
+        return None, None
+
+
+def get_secret(key):
+    """Safe fallback for local + cloud secrets."""
+    try:
+        val = st.secrets.get(key)
+        if val:
+            return val
+    except Exception:
+        pass
+
+    return os.environ.get(key)
+
+
 @st.cache_resource
-def load_bundle_with_feature_names(bundle_rel_path, feat_rel_path, remote_bundle_url=None, remote_feat_url=None):
-    """
-    Load model bundle and feature_names. Try local first, then remote URLs if provided.
-    Returns: (bundle_dict, feature_names_list)
-    """
-    bundle_path = APP_DIR.joinpath(bundle_rel_path)
-    feat_path = APP_DIR.joinpath(feat_rel_path)
+def load_bundle_with_feature_names(bundle_file, feat_file,
+                                  remote_bundle_url=None,
+                                  remote_feat_url=None):
+    """Load model bundle & feature names ‚Äî local first, then remote URLs."""
+    local_bundle = APP_DIR / bundle_file
+    local_feat = APP_DIR / feat_file
 
-    # Try local
-    if bundle_path.exists() and feat_path.exists():
-        b = joblib.load(bundle_path)
-        f = joblib.load(feat_path)
-        return b, f
+    # 1) Try local
+    if local_bundle.exists() and local_feat.exists():
+        bundle = joblib.load(local_bundle)
+        feat = joblib.load(local_feat)
+        return bundle, feat
 
-    # Try remote bundle and feature names (if URLs provided in secrets)
+    # 2) If not local, try remote (from secrets/env)
+    if remote_bundle_url is None:
+        remote_bundle_url = (
+            get_secret("CLASSIFIER_BUNDLE_URL")
+            if "classification" in bundle_file else
+            get_secret("REGRESSOR_BUNDLE_URL")
+        )
+
+    if remote_feat_url is None:
+        remote_feat_url = (
+            get_secret("CLASSIFIER_FEAT_URL")
+            if "classification" in feat_file else
+            get_secret("REGRESSOR_FEAT_URL")
+        )
+
+    # 3) Download remote files
     if remote_bundle_url and remote_feat_url:
-        # download bundle
-        rb = requests.get(remote_bundle_url, timeout=30)
-        rb.raise_for_status()
-        b = joblib.load(io.BytesIO(rb.content))
-        # download feature names
-        rf = requests.get(remote_feat_url, timeout=30)
-        rf.raise_for_status()
-        f = joblib.load(io.BytesIO(rf.content))
-        return b, f
+        try:
+            rb = requests.get(remote_bundle_url, timeout=30)
+            rb.raise_for_status()
+            bundle = joblib.load(io.BytesIO(rb.content))
+        except Exception as e:
+            raise RuntimeError(f"Failed to load remote model bundle: {e}")
 
-    # Not found
-    raise FileNotFoundError(f"Missing files locally: {bundle_path} or {feat_path}. Provide files or set remote URLs in st.secrets.")
+        try:
+            rf = requests.get(remote_feat_url, timeout=30)
+            rf.raise_for_status()
+            feat = joblib.load(io.BytesIO(rf.content))
+        except Exception as e:
+            raise RuntimeError(f"Failed to load remote feature file: {e}")
 
-# ---------- UI: choose model ----------
-model_type = st.selectbox("Model type", ["classification", "regression"])
+        return bundle, feat
+
+    # 4) If nothing found
+    raise FileNotFoundError(
+        "Model files not found locally or via secrets.\n"
+        "Add pickles to your repo OR set remote URLs in Streamlit Cloud secrets."
+    )
+
+
+# -------------------------------------------------------------
+# MODEL SELECTION
+# -------------------------------------------------------------
+
+model_type = st.selectbox("Choose Model Type", ["classification", "regression"])
 
 if model_type == "classification":
     bundle_rel = "best_bundle_classification.pkl"
-    feat_rel = "feature_names_classification.pkl"
-    remote_bundle = st.secrets.get("CLASSIFIER_BUNDLE_URL")
-    remote_feat = st.secrets.get("CLASSIFIER_FEAT_URL")
+    feat_rel   = "feature_names_classification.pkl"
 else:
     bundle_rel = "best_bundle_regression.pkl"
-    feat_rel = "feature_names_regression.pkl"
-    remote_bundle = st.secrets.get("REGRESSOR_BUNDLE_URL")
-    remote_feat = st.secrets.get("REGRESSOR_FEAT_URL")
+    feat_rel   = "feature_names_regression.pkl"
 
-# ---------- load model (cached) ----------
+# -------------------------------------------------------------
+# LOAD MODEL
+# -------------------------------------------------------------
+
 try:
-    bundle, feature_names = load_bundle_with_feature_names(bundle_rel, feat_rel,
-                                                           remote_bundle_url=remote_bundle,
-                                                           remote_feat_url=remote_feat)
-except Exception as e:
-    st.error(f"Model files missing or load error: {e}")
-    st.info(
-        "Place the model pkl files in the app folder (same as app.py) or set remote URLs in Streamlit Secrets."
+    bundle, feature_names = load_bundle_with_feature_names(
+        bundle_rel,
+        feat_rel,
+        remote_bundle_url=None,
+        remote_feat_url=None
     )
+except Exception as e:
+    st.error(f"Error loading model: {e}")
     st.stop()
 
-preprocessor = bundle["preprocessor"]
-model = bundle["model"]
-st.write("Loaded model:", type(model).__name__)
+preprocessor = bundle.get("preprocessor")
+model = bundle.get("model")
 
-# ---------- file upload / inference ----------
-uploaded = st.file_uploader("Upload CSV (columns will be normalized)", type=["csv"])
+st.success(f"Loaded model: {type(model).__name__}")
+
+# -------------------------------------------------------------
+# FILE UPLOAD
+# -------------------------------------------------------------
+
+uploaded = st.file_uploader("Upload CSV", type=["csv"])
+
 if uploaded:
+    df, used_enc = safe_read_csv(uploaded)
+
+    if df is None:
+        st.error("Unable to read CSV. Please save your CSV as UTF-8 and try again.")
+        st.stop()
+
+    st.info(f"CSV loaded using encoding: {used_enc}")
+
+    # Clean and align
+    df = normalize_cols(df)
+    X = df.reindex(columns=feature_names, fill_value=0)
+
+    # Prediction
     try:
-        # Try common encodings automatically
-        raw = uploaded.read()
-        for enc in ("utf-8", "utf-8-sig", "cp1252", "latin1"):
-            try:
-                df = pd.read_csv(io.BytesIO(raw), encoding=enc)
-                break
-            except Exception:
-                df = None
-        if df is None:
-            st.error("Could not parse uploaded CSV. Try saving it as UTF-8 CSV and upload again.")
-        else:
-            df = normalize_cols(df)
-            X_aligned = df.reindex(columns=feature_names, fill_value=0)
-            # optional: coerce numeric types if needed
-            try:
-                X_proc = preprocessor.transform(X_aligned)
-                preds = model.predict(X_proc)
-                st.success("Predictions generated")
-                st.write(preds.tolist())
-            except Exception as e:
-                st.error(f"Error during transform/predict: {e}")
-                st.write("Expected features (sample):", feature_names[:20])
-                st.write("Provided columns (sample):", X_aligned.columns.tolist()[:20])
+        X_proc = preprocessor.transform(X)
+        preds = model.predict(X_proc)
+
+        df_out = df.copy()
+        df_out["prediction"] = preds
+
+        st.success("Predictions generated!")
+        st.dataframe(df_out)
+
     except Exception as e:
-        st.error(f"Failed to read uploaded file: {e}")
+        st.error(f"Prediction error: {e}")
+        st.write("Expected columns:", feature_names[:20])
+        st.write("Your columns:", list(X.columns)[:20])
+
 else:
-    st.info("Upload a CSV to run batch predictions, or add UI for single-row input.")
+    st.info("Upload a CSV file to get predictions.")
